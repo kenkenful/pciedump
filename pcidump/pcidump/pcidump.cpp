@@ -1,308 +1,364 @@
-﻿#include <iostream>
+#include <iostream>
 #include <windows.h>
+#include <initguid.h>
+#include <devpropdef.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
+#include <devguid.h>
+#define INITGUID
+
 #include <devpkey.h>
 #include <pciprop.h>
+#include <memory>
+#include <vector>
+#include <iomanip>
 
-#pragma comment(lib, "setupapi.lib")
-#pragma comment(lib, "cfgmgr32.lib")
+#pragma comment (lib, "setupapi.lib")
+#pragma comment (lib, "cfgmgr32.lib")
+
+typedef struct _PICE_INFO {
+	WORD domain;
+	WORD bus;
+	WORD dev;
+	WORD func;
+	WORD secondary_domain;
+	WORD secondary_bus;
+	WORD secondary_dev;
+
+	WORD secondary_func;
+	DWORD physicaldrive_no;
+	char dev_inst_path[MAX_PATH] = { 0 };
+	char disk_inst_path[MAX_PATH] = { 0 };
+
+	UINT32 classCode;
+	UINT32 subClassCode;
+	UINT32 progIF;
+
+}PCIE_INFO;
+
+std::vector<std::unique_ptr<PCIE_INFO>> list_nvme(void);
+std::vector<std::unique_ptr<PCIE_INFO>> list_pci(BOOL);
 
 
+bool GetUInt32Property(DEVINST devInst, const DEVPROPKEY& propKey, UINT32& result) {
+	DEVPROPTYPE propertyType;
+	ULONG bufferSize = sizeof result;
 
-typedef struct _GuestPCIAddress {
+	auto cr = CM_Get_DevNode_PropertyW(
+		devInst,
+		&propKey,
+		&propertyType,
+		reinterpret_cast<BYTE*>(&result),
+		&bufferSize, 0
+	);
+	return cr == CR_SUCCESS && propertyType == DEVPROP_TYPE_UINT32;
+}
 
-	DWORD domain;
-	DWORD bus;
-	DWORD slot;
-	DWORD function;
-}GuestPCIAddress;
 
+std::vector<std::unique_ptr<PCIE_INFO>> list_nvme() {
+	return list_pci(true);
+}
 
-static void get_pci_address_for_device(GuestPCIAddress *pci, HDEVINFO dev_info);
+std::vector<std::unique_ptr<PCIE_INFO>> list_pci(BOOL isNvme) {
+	std::vector<std::unique_ptr<PCIE_INFO>> pcie_info;
 
+	SP_DEVINFO_DATA pci_info_data = { 0 };
+	pci_info_data.cbSize = sizeof(SP_DEVINFO_DATA);
 
-int main()
-{
-	HDEVINFO dev_info = INVALID_HANDLE_VALUE;
-	HDEVINFO parent_dev_info = INVALID_HANDLE_VALUE;
+	DWORD domain = 0, bus = 0, dev = 0, func = 0, bus_num = 0;
+	ULONG reg_type = 0, reg_len = 0;
+	DWORD address = 0;
 
-	SP_DEVINFO_DATA dev_info_data;
-	SP_DEVICE_INTERFACE_DATA dev_iface_data;
-	HANDLE dev_file;
-
-	int i;
-	GuestPCIAddress *pci = (GuestPCIAddress*)malloc(sizeof(GuestPCIAddress));
-
-	dev_info = SetupDiGetClassDevs(&GUID_DEVINTERFACE_DISK, 0, 0,
-		DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-
-	if (dev_info == INVALID_HANDLE_VALUE) {
-		std::cout << "failed to get devices tree    " << GetLastError() << std::endl;
-		return -1;
+	HDEVINFO hdi = SetupDiGetClassDevs(nullptr, "PCI", nullptr, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+	if (hdi == INVALID_HANDLE_VALUE) {
+		std::cerr << "failed to get device tree, errno: " << GetLastError() << std::endl;
+		exit;
 	}
 
-	dev_info_data.cbSize = sizeof(SP_DEVINFO_DATA);
-	dev_iface_data.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+	for (int i = 0; SetupDiEnumDeviceInfo(hdi, i, &pci_info_data); ++i) {
+		UINT32 classCode;
+		UINT32 subClassCode;
+		UINT32 progIF;
 
-	for (i = 0; SetupDiEnumDeviceInfo(dev_info, i, &dev_info_data); i++) {
-		PSP_DEVICE_INTERFACE_DETAIL_DATA pdev_iface_detail_data = NULL;
-		STORAGE_DEVICE_NUMBER sdn;
-		char *parent_dev_id = NULL;
-		SP_DEVINFO_DATA parent_dev_info_data;
+		if (!GetUInt32Property(pci_info_data.DevInst, DEVPKEY_PciDevice_BaseClass, classCode)
+			|| !GetUInt32Property(pci_info_data.DevInst, DEVPKEY_PciDevice_SubClass, subClassCode)
+			|| !GetUInt32Property(pci_info_data.DevInst, DEVPKEY_PciDevice_ProgIf, progIF)) {
+			continue;
+		}
+
+		if (isNvme) {
+			if (classCode == 0x1 && subClassCode == 0x8 && progIF == 0x2) {
+				// NVMe device		
+			}
+			else {
+				// not NVMe device
+				continue;
+			}
+		}
+
+		std::unique_ptr<PCIE_INFO> pcie_if = std::make_unique<PCIE_INFO>();
+
+		pcie_if->classCode = classCode;
+		pcie_if->subClassCode = subClassCode;
+		pcie_if->progIF = progIF;
+		pcie_if->physicaldrive_no = 0xffffffff;
+
+		reg_len = sizeof(bus_num);
+
+		auto cr = CM_Get_DevNode_Registry_PropertyA(pci_info_data.DevInst, CM_DRP_BUSNUMBER, &reg_type, &bus_num, & reg_len, 0 );
+		if (cr == CR_SUCCESS && reg_type == REG_DWORD && reg_len == sizeof(bus_num)) {
+			pcie_if->domain = bus_num >> 8;
+			pcie_if->bus = bus_num & 0xff;
+		}
+		else {
+			continue;
+		}
+
+		cr = CM_Get_DevNode_Registry_PropertyA(pci_info_data.DevInst, CM_DRP_ADDRESS, &reg_type, &address, &reg_len, 0);
+		if (cr == CR_SUCCESS && reg_type == REG_DWORD && reg_len == sizeof(address)) {
+			pcie_if->dev = address >> 16;
+			pcie_if->func = address & 0xffff;
+		}
+		else {
+			continue;
+		
+		}
+
+		char* device_instance_path = nullptr;
 		DWORD size = 0;
-		//g_debug("getting device path");
 
-		if (SetupDiEnumDeviceInterfaces(dev_info, &dev_info_data, &GUID_DEVINTERFACE_DISK, 0, &dev_iface_data)) {
+		cr = CM_Get_Device_ID_Size(&size, pci_info_data.DevInst, 0);
 
+		if (cr != CR_SUCCESS) {
+			std::cerr << "failed to get device instance id : " << GetLastError() << std::endl;
+			continue;
+		}
 
-			if (!SetupDiGetDeviceInterfaceDetail(dev_info, &dev_iface_data, pdev_iface_detail_data, size, &size, &dev_info_data)) {
+		++size;
+		device_instance_path = (char*)malloc(size);
+
+		cr = CM_Get_Device_ID(pci_info_data.DevInst, device_instance_path, size, 0);
+
+		strcpy_s(pcie_if->dev_inst_path, MAX_PATH, device_instance_path);
+
+		DEVINST parent_dev_inst = 0;
+
+		cr = CM_Get_Parent(&parent_dev_inst, pci_info_data.DevInst, 0);
+		if (cr == CR_SUCCESS) {
+			CM_Get_DevNode_Registry_PropertyA(parent_dev_inst, CM_DRP_BUSNUMBER, &reg_type, &bus_num, &reg_len, 0);
+			if (cr == CR_SUCCESS && reg_type == REG_DWORD && reg_len == sizeof(bus_num)) {
+				pcie_if->secondary_domain = bus_num >> 8;
+				pcie_if->secondary_domain = bus_num & 0xff;
+			}
+			else {
+				continue;
+			}
+		
+			CM_Get_DevNode_Registry_PropertyA(parent_dev_inst, CM_DRP_ADDRESS, &reg_type, &address, &reg_len, 0);
+			if (cr == CR_SUCCESS && reg_type == REG_DWORD && reg_len == sizeof(address)) {
+				pcie_if->secondary_dev = address >> 16;
+				pcie_if->secondary_func = address & 0xffff;
+			}
+			else {
+				continue;
+			}
+		}
+		else {
+			std::cerr << "secondary bus is not found :" << GetLastError() << std::endl;
+			continue;
+		}
+
+		pcie_info.push_back(std::move(pcie_if));
+
+	}
+
+	STORAGE_DEVICE_NUMBER sdn = { 0 };
+	SP_DEVICE_INTERFACE_DATA disk_info_data = { 0 };
+
+	HDEVINFO dev_info = SetupDiGetClassDevs(&GUID_DEVINTERFACE_DISK, 0,0, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+	if (dev_info == INVALID_HANDLE_VALUE) {
+		std::cerr << "failed to get device tree: " << GetLastError() << std::endl;
+		exit;
+	}
+
+	disk_info_data.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+
+	for (int i = 0; SetupDiEnumDeviceInfo(dev_info, i, &pci_info_data); ++i) {
+		PSP_DEVICE_INTERFACE_DETAIL_DATA pdev_iface_detail_data = nullptr;
+		char* device_instance_path = nullptr;
+
+		SP_DEVINFO_DATA dev_info_data;
+
+		DWORD size = 0;
+		char* disk_device_instance_path = nullptr;
+
+		{
+			DWORD size = 0;
+			auto cr = CM_Get_Device_ID_Size(&size, pci_info_data.DevInst, 0);
+			if (cr != CR_SUCCESS) {
+				std::cerr << "failed to get disk device instance id: " << GetLastError() << std::endl;
+				continue;
+			}
+			++size;
+			disk_device_instance_path = (char*)malloc(size);
+			cr = CM_Get_Device_ID(pci_info_data.DevInst, disk_device_instance_path, size, 0);
+		}
+
+		if (SetupDiEnumDeviceInterfaces(dev_info, &pci_info_data, &GUID_DEVINTERFACE_DISK, 0, &disk_info_data)) {
+			if (!SetupDiGetDeviceInterfaceDetail(dev_info, &disk_info_data, pdev_iface_detail_data, size, &size, &pci_info_data)) {
 				if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
 					pdev_iface_detail_data = (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(size);
 					pdev_iface_detail_data->cbSize = sizeof(*pdev_iface_detail_data);
 				}
 				else {
-					std::cout << "failed to get device interfaces  " << GetLastError() << std::endl;
-					//error_setg_win32(errp, GetLastError(),
-					//	"failed to get device interfaces");
-					//continue;
-					
-					goto end;
+					std::cerr << "failed to get device interface: " << GetLastError() << std::endl;
+					continue;
 				}
 			}
-			if (!SetupDiGetDeviceInterfaceDetail(dev_info, &dev_iface_data, pdev_iface_detail_data, size, &size, &dev_info_data)) {
-				// pdev_iface_detail_data already is allocated
-				
-				std::cout << "failed to get device interfaces    " << GetLastError() << std::endl;
-					//error_setg_win32(errp, GetLastError(),
-					//"failed to get device interfaces");
-				goto end;
-				//continue;
+
+			if (!SetupDiGetDeviceInterfaceDetail(dev_info, &disk_info_data, pdev_iface_detail_data, size, &size, &pci_info_data)) {
+				std::cerr << "failed to get device interfaces: " << GetLastError() << std::endl;
+				continue;
 			}
 
-			dev_file = CreateFile(pdev_iface_detail_data->DevicePath, 0, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+			HANDLE dev_file = CreateFile(pdev_iface_detail_data->DevicePath, 0, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
 
-			if (!DeviceIoControl(dev_file, IOCTL_STORAGE_GET_DEVICE_NUMBER, NULL, 0, &sdn, sizeof(sdn), &size, NULL)) {
+			if (dev_file == INVALID_HANDLE_VALUE) {
+				std::cerr << "failed to CreateFile: " << GetLastError() << std::endl;
+				continue;
+			}
+
+			if (!DeviceIoControl(dev_file, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0, &sdn, sizeof(sdn), &size, nullptr)) {
 				CloseHandle(dev_file);
-				std::cout << "failed to get device slot number     " << GetLastError() << std::endl;
-				//error_setg_win32(errp, GetLastError(),
-				//	"failed to get device slot number");
-				goto end;
-				//continue;
+				std::cerr << "failed to get device slot number: " << GetLastError() << std::endl;
+				continue;
 			}
-			CloseHandle(dev_file);
 
-			//if (sdn.DeviceNumber != number) {
-			std::cout << "PHYSICALDISK NUMBER: " << sdn.DeviceNumber << std::endl;
-			//goto end;
-			//if (sdn.DeviceNumber != number) {
-			//	continue;
-			//}
+			CloseHandle(dev_file);
 		}
 		else {
-			std::cout << "failed to get device interfaces      " << GetLastError() << std::endl;
-			//error_setg_win32(errp, GetLastError(),
-			//	"failed to get device interfaces");
+			std::cerr << "failed to get device interface: " << GetLastError() << std::endl;
+			continue;
+		}
+
+		char* bus_relation = nullptr;
+
+		// Get Bus relation Size and create buffer
+		if (!SetupDiGetDeviceInstanceId(dev_info, &pci_info_data, bus_relation, size, &size)) {
+			if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+				bus_relation = (char*)malloc(size);
+			}
+			else {
+				std::cerr << "failed to get device instance ID: " << GetLastError() << std::endl;
+				continue;
+			}
+		}
+
+		// Get Bus relation
+		if (!SetupDiGetDeviceInstanceId(dev_info, &pci_info_data, bus_relation, size, &size)) {
+			std::cerr << "failed to get device instance ID: " << GetLastError() << std::endl;
+			continue;
+		}
+
+		DEVINST dev_inst, parent_dev_inst;
+		size = 0;
+
+		auto cr = CM_Locate_DevInst(&dev_inst, bus_relation, 0);
+		if (cr != CR_SUCCESS) {
+			std::cerr << "failed to get device instance: " << GetLastError() << std::endl;
 			goto end;
-			//continue;
 		}
 
-
-#if 1
-		//g_debug("found device slot %d. Getting storage controller", number);
-
-
-		{
-			CONFIGRET cr;
-			DEVINST dev_inst, parent_dev_inst;
-			ULONG dev_id_size = 0;
-			size = 0;
-			if (!SetupDiGetDeviceInstanceId(dev_info, &dev_info_data, parent_dev_id, size, &size)) {
-				if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-					parent_dev_id = (char*)malloc(size);
-				}
-				else {
-					std::cout << "failed to get device instance ID      " << GetLastError() << std::endl;
-
-					//error_setg_win32(errp, GetLastError(),
-						//"failed to get device instance ID");
-					goto end;
-				}
-			}
-			if (!SetupDiGetDeviceInstanceId(dev_info, &dev_info_data, parent_dev_id, size, &size)) {
-				// parent_dev_id already is allocated
-				std::cout << "failed to get device instance ID     " << GetLastError() << std::endl;
-				//error_setg_win32(errp, GetLastError(),
-				//	"failed to get device instance ID");
-				goto end;
-			}
-
-			/*
-			 * CM API used here as opposed to
-			 * SetupDiGetDeviceProperty(..., DEVPKEY_Device_Parent, ...)
-			 * which exports are only available in mingw-w64 6+
-			 */
-			cr = CM_Locate_DevInst(&dev_inst, parent_dev_id, 0);
-			if (cr != CR_SUCCESS) {
-				//g_error("CM_Locate_DevInst failed with code %lx", cr);
-				//error_setg_win32(errp, GetLastError(),"failed to get device instance");
-				std::cout << "failed to get device instance     " << GetLastError() << std::endl;
-				goto end;
-			}
-			cr = CM_Get_Parent(&parent_dev_inst, dev_inst, 0);
-			if (cr != CR_SUCCESS) {
-				//g_error("CM_Get_Parent failed with code %lx", cr);
-				//error_setg_win32(errp, GetLastError(),"failed to get parent device instance");
-				std::cout << "failed to get parent device instance      " << GetLastError() << std::endl;
-				goto end;
-			}
-
-			cr = CM_Get_Device_ID_Size(&dev_id_size, parent_dev_inst, 0);
-			if (cr != CR_SUCCESS) {
-				//g_error("CM_Get_Device_ID_Size failed with code %lx", cr);
-				std::cout << "failed to get parent device ID length        " << GetLastError() << std::endl;
-				//error_setg_win32(errp, GetLastError(),"failed to get parent device ID length");
-				goto end;
-			}
-
-			++dev_id_size;
-			if (dev_id_size > size) {
-				free(parent_dev_id);
-				parent_dev_id = (char*)malloc(dev_id_size);
-			}
-
-			cr = CM_Get_Device_ID(parent_dev_inst, parent_dev_id, dev_id_size, 0);
-
-			if (cr != CR_SUCCESS) {
-				//g_error("CM_Get_Device_ID failed with code %lx", cr);
-				//error_setg_win32(errp, GetLastError(),"failed to get parent device ID");
-				std::cout << "failed to get parent device ID         " << GetLastError() << std::endl;
-				goto end;
-			}
+		cr = CM_Get_Parent(&parent_dev_inst, dev_inst, 0);
+		if (cr != CR_SUCCESS) {
+			std::cerr << "failed to get parent device instance : " << GetLastError() << std::endl;
 		}
 
-		//g_debug("querying storage controller %s for PCI information",parent_dev_id);
-		parent_dev_info = SetupDiGetClassDevs(&GUID_DEVINTERFACE_STORAGEPORT, parent_dev_id,NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+		cr = CM_Get_Device_ID_Size(&size, parent_dev_inst, 0);
+		if (cr != CR_SUCCESS) {
+			std::cerr << "failed to get parenet device ID length:  " << GetLastError() << std::endl;
+			continue;
+		}
+
+		++size;
+		device_instance_path = (char*)malloc(size);
+		
+		cr = CM_Get_Device_ID(parent_dev_inst, device_instance_path, size, 0);
+		if (cr != CR_SUCCESS) {
+			std::cerr << "failed to get parenet device ID: " << GetLastError << std::endl;
+			continue;
+		}
+
+		HDEVINFO parent_dev_info = SetupDiGetClassDevs(&GUID_DEVINTERFACE_STORAGEPORT, device_instance_path, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
 		if (parent_dev_info == INVALID_HANDLE_VALUE) {
-			//error_setg_win32(errp, GetLastError(),"failed to get parent device");
-			std::cout << "failed to get parent device    " << GetLastError() << std::endl;
-			goto end;
+			std::cerr << "failed to get device instance path: " << GetLastError() << std::endl;
+			continue;
 		}
-		parent_dev_info_data.cbSize = sizeof(SP_DEVINFO_DATA);
 
-		if (!SetupDiEnumDeviceInfo(parent_dev_info, 0, &parent_dev_info_data)) {
-			std::cout << "failed to get parent device data      " << GetLastError() << std::endl;
-			//error_setg_win32(errp, GetLastError(),"failed to get parent device data");
-			goto end;
+		dev_info_data.cbSize = sizeof( SP_DEVINFO_DATA);
+
+		if (!SetupDiEnumDeviceInfo(parent_dev_info, 0, &dev_info_data)) {
+			std::cerr << "failed to get parent device data: " << GetLastError() << std::endl;
+			continue;
 		}
-#endif
 
-		//get_pci_address_for_device(pci, parent_dev_info);
-		get_pci_address_for_device(pci, parent_dev_info);
+		cr = CM_Get_DevNode_Registry_PropertyA(dev_info_data.DevInst, CM_DRP_BUSNUMBER, &reg_type, &bus_num, &reg_len, 0);
+		if(cr == CR_SUCCESS && reg_type == REG_DWORD && reg_len == sizeof(bus_num)){
+			domain = bus_num >> 8;
+			bus = bus_num & 0xff;
+		}
+		else {
+			std::cerr << "failed to get domain and bus " << std::endl;
+			continue;
+		}
 
-		
-		
-		//break;
+		cr = CM_Get_DevNode_Registry_PropertyA(dev_info_data.DevInst, CM_DRP_ADDRESS, &reg_type, &address, &reg_len, 0);
+		if (cr == CR_SUCCESS && reg_type == REG_DWORD && reg_len == sizeof(address)) {
+			dev = address >> 16;
+			func = address & 0xffff;
+		}
+		else {
+			std::cerr << "failed to get dev and func " << std::endl;
+			continue;
+		}
+
+		//std::cout << std::hex;
+		//std::cout <<  std::setw(4) << std::setfill('0') << domain << std::setw(2) << bus << ":" << std::setw(2) << dev << "." << std::setw(2) << func << std::endl;
+
+		for (auto& v : pcie_info) {
+			if (v->domain == domain && v->bus == bus && v->dev == dev && v->func == func) {
+				v->physicaldrive_no = sdn.DeviceNumber;
+				strcpy_s(v->disk_inst_path, MAX_PATH, disk_device_instance_path);
+				break;
+			}
+		}
+
+		if (parent_dev_info) SetupDiDestroyDeviceInfoList(parent_dev_info);
+
 	}
-
 
 end:
-	if (parent_dev_info != INVALID_HANDLE_VALUE) {
-		SetupDiDestroyDeviceInfoList(parent_dev_info);
-	}
-	if (dev_info != INVALID_HANDLE_VALUE) {
-		SetupDiDestroyDeviceInfoList(dev_info);
-	}
-	
-	return 0;
+	if (hdi) SetupDiDestroyDeviceInfoList(hdi);
+	if (dev_info) SetupDiDestroyDeviceInfoList(dev_info);
 
-
-   
+	return pcie_info;
 }
 
-
-
-
-
-
-
-static void get_pci_address_for_device(GuestPCIAddress *pci, HDEVINFO dev_info)
-{
-	SP_DEVINFO_DATA dev_info_data;
-	DWORD j;
-	DWORD size;
-	bool partial_pci = false;
-	dev_info_data.cbSize = sizeof(SP_DEVINFO_DATA);
-
-	for (j = 0; SetupDiEnumDeviceInfo(dev_info, j, &dev_info_data); j++) {
-		DWORD addr=0, bus=0, ui_slot=0, type;
-		int func=0, slot=0;
-		size = sizeof(DWORD);
-		/*
-		* There is no need to allocate buffer in the next functions. The
-		* size is known and ULONG according to
-		* https://msdn.microsoft.com/en-us/library/windows/hardware/ff543095(v=vs.85).aspx
-		*/
-		if (!SetupDiGetDeviceRegistryProperty( dev_info, &dev_info_data, SPDRP_BUSNUMBER, &type, (PBYTE)&bus, size, NULL)) {
-			//debug_error("failed to get PCI bus");
-			std::cout << "failed to get PCI bus" << std::endl;
-			bus = -1;
-			partial_pci = true;
-		}
-
-		/*
-		* The function retrieves the device's address. This value will be
-		* transformed into device function and number
-		*/
-		if (!SetupDiGetDeviceRegistryProperty(dev_info, &dev_info_data, SPDRP_ADDRESS, &type, (PBYTE)&addr, size, NULL)) {
-			//debug_error("failed to get PCI address");
-			std::cout << "failed to get PCI address" << std::endl;
-			addr = -1;
-			partial_pci = true;
-		}
-
-		/*
-		* This call returns UINumber of DEVICE_CAPABILITIES structure.
-		* This number is typically a user-perceived slot number.
-		*/
-		//if (!SetupDiGetDeviceRegistryProperty(dev_info, &dev_info_data, SPDRP_UI_NUMBER, &type, (PBYTE)&ui_slot, size, NULL)) {
-			//debug_error("failed to get PCI slot");
-			//std::cout << "failed to get PCI slot" << std::endl;
-			//ui_slot = -1;
-			//partial_pci = true;
-		//}
-
-		/*
-		* SetupApi gives us the same information as driver with
-		* IoGetDeviceProperty. According to Microsoft:
-		*
-		*   FunctionNumber = (USHORT)((propertyAddress) & 0x0000FFFF)
-		*   DeviceNumber = (USHORT)(((propertyAddress) >> 16) & 0x0000FFFF)
-		*   SPDRP_ADDRESS is propertyAddress, so we do the same.
-		*
-		* https://docs.microsoft.com/en-us/windows/desktop/api/setupapi/nf-setupapi-setupdigetdeviceregistrypropertya
-		*/
-		//if (partial_pci) {
-		//	pci->domain = -1;
-		//	pci->slot = -1;
-		//	pci->function = -1;
-		//	pci->bus = -1;
-		//	continue;
-		//}
-		//else {
-			func = ((int)addr == -1) ? -1 : addr & 0x0000FFFF;
-			slot = ((int)addr == -1) ? -1 : (addr >> 16) & 0x0000FFFF;
-			//if ((int)ui_slot != slot) {
-			//	//g_debug("mismatch with reported slot values: %d vs %d", (int)ui_slot, slot);
-			//}
-			pci->domain = 0;
-			//pci->slot = (int)ui_slot;
-			pci->function = func;
-			pci->bus = (int)bus;
-			std::cout << pci->domain << ":" << bus << ":" << slot << "." << func << std::endl;
-
-			//return;
-		//}
-
+void print(std::vector<std::unique_ptr<PCIE_INFO>> &vec) {
+	for (auto& v : vec) {
+		std::cout << "-------" << std::endl;
+		std::cout << std::hex;
+		std::cout << "Physical Disk No: " << v->physicaldrive_no << std::endl;
+		std::cout << "Class Code: " << v->classCode << ", Sub Class Code: " << v->subClassCode << std::endl;
+		std::cout << "Primary BDF: " << std::setw(4) << std::setfill('0') << v-> domain << std::setw(2) << v-> bus << ":" << std::setw(2) << v -> dev << "." << std::setw(2) << v-> func << std::endl;
+		std::cout << "Secondary BDF: " << std::setw(4) << std::setfill('0') << v->secondary_domain << std::setw(2) << v->secondary_bus << ":" << std::setw(2) << v->secondary_dev << "." << std::setw(2) << v->secondary_func << std::endl;
+		std::cout << "Device Instance path: " << v->dev_inst_path << std::endl;
+		std::cout << "Disk Instance path: " << v->disk_inst_path << std::endl;
 	}
+}
+
+int main() {
+	auto u = list_nvme();
+	print(u);
+	system("pause");
 }
